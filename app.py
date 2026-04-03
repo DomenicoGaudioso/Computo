@@ -869,7 +869,7 @@ with tab_stampa:
         with dl3:
             csv = computo_to_dataframe(st.session_state.computo).to_csv(index=False, sep=";", decimal=",")
             st.download_button("📃 Scarica CSV", data=csv, file_name="computo_metrico.csv",
-                               mime="text/csv", use_container_width=True, , key="3")
+                               mime="text/csv", use_container_width=True, key="3")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
