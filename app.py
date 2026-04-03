@@ -853,7 +853,7 @@ with tab_stampa:
                 xl = export_excel(st.session_state.computo, titolo)
                 st.download_button("📊 Scarica Excel", data=xl, file_name="computo_metrico.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True, type="primary")
+                                   use_container_width=True, type="primary", key="1")
             except Exception as e:
                 st.error(f"Excel: {e}")
         with dl2:
@@ -861,7 +861,7 @@ with tab_stampa:
                 pdf = export_pdf(st.session_state.computo, titolo)
                 st.download_button("📄 Scarica PDF", data=pdf, file_name="computo_metrico.pdf",
                                    mime="application/pdf",
-                                   use_container_width=True, type="primary")
+                                   use_container_width=True, type="primary", key="2")
             except ImportError:
                 st.warning("⚠️ `pip install reportlab`")
             except Exception as e:
@@ -869,7 +869,7 @@ with tab_stampa:
         with dl3:
             csv = computo_to_dataframe(st.session_state.computo).to_csv(index=False, sep=";", decimal=",")
             st.download_button("📃 Scarica CSV", data=csv, file_name="computo_metrico.csv",
-                               mime="text/csv", use_container_width=True)
+                               mime="text/csv", use_container_width=True, , key="3")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -970,7 +970,7 @@ with tab_export:
                 xl = export_excel(st.session_state.computo, titolo)
                 st.download_button("📊 Scarica Excel", data=xl, file_name="computo_metrico.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                   use_container_width=True, type="primary")
+                                   use_container_width=True, type="primary", key="4")
             except Exception as e:
                 st.error(f"Errore Excel: {e}")
 
@@ -981,7 +981,7 @@ with tab_export:
                 pdf = export_pdf(st.session_state.computo, titolo)
                 st.download_button("📄 Scarica PDF", data=pdf, file_name="computo_metrico.pdf",
                                    mime="application/pdf",
-                                   use_container_width=True, type="primary")
+                                   use_container_width=True, type="primary", key="5")
             except ImportError:
                 st.warning("⚠️ `pip install reportlab`")
             except Exception as e:
@@ -992,7 +992,7 @@ with tab_export:
             st.markdown("Formato tabulare: Prg., Articolo, Breve, Lotto, WBS, Quantità, P.U., Importo.")
             csv = computo_to_dataframe(st.session_state.computo).to_csv(index=False, sep=";", decimal=",")
             st.download_button("📃 Scarica CSV", data=csv, file_name="computo_metrico.csv",
-                               mime="text/csv", use_container_width=True)
+                               mime="text/csv", use_container_width=True, key="6")
 
         st.markdown("---")
         st.markdown("#### Anteprima dati esportati")
