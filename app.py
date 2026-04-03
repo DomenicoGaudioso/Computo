@@ -381,7 +381,7 @@ with st.sidebar:
         json_str = export_json(st.session_state.computo, list(st.session_state.prezziari.keys()))
         st.download_button("💾 Salva progetto JSON", data=json_str.encode(),
                            file_name="computo.json", mime="application/json",
-                           use_container_width=True)
+                           use_container_width=True, key="scarica_csv_computo_unico")
     json_up = st.file_uploader("Riapri progetto JSON", type=["json"], key="json_up")
     if json_up and st.button("📂 Carica progetto", use_container_width=True):
         try:
