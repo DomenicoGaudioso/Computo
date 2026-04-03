@@ -1,0 +1,14 @@
+{
+  "name": "computo",
+  "build_context": "Computo",
+  "icon": "euro",
+  "title": {
+    "en": "Computo",
+    "it": "Computo"
+  },
+  "description": {
+    "en": "web app for building quantity surveys",
+    "it": "web app per la costruzione di computi metrici estimativi"
+  },
+  "required_subscription": "free"
+}

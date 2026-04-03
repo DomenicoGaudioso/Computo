@@ -1,0 +1,9 @@
+[server]
+    port = 3000
+    headless = true
+    enableCORS = false
+    baseUrlPath = "computo"
+
+[theme]
+    base="light"
+    primaryColor="blue"
