@@ -1,34 +1,64 @@
 """
 src.py  –  Motore di calcolo per il Computo Metrico Estimativo
 ==============================================================
-Logica pura, zero dipendenze da Streamlit.
+Versione 2.0 – Strutture dati aggiornate:
+  · Tabella Sintesi: progressiva, articolo, descrizione_breve, lotto, WBS, categoria
+  · Libretto Misure: commento, simili (n°), lung, larg, alt, quantita_diretta
+  · Tipi voce: standard | sovrapprezzo_pct | riferimento
+  · Tipi riga misurazione: standard | sottrazione | riferimento_voce
 
-Struttura dati principale
---------------------------
-VOCE DI COMPUTO (dict):
-    id                : int   – identificatore univoco
-    wbs               : str   – codice WBS es. "1.2.3"
-    categoria         : str   – etichetta categoria
-    sottocategoria    : str   – etichetta sottocategoria (opzionale)
-    codice            : str   – codice tariffa prezziario
-    descrizione       : str   – testo descrittivo
-    um                : str   – unità di misura
-    prezzo_unitario   : float
-    note              : str
-    misurazioni       : list[MISURAZIONE]
-    quantita_totale   : float  (calcolato)
-    importo           : float  (calcolato)
+Schema JSON – Voce di Computo
+──────────────────────────────
+{
+  "id": 3,
+  "progressiva":      "1.3",
+  "articolo":         "SC.02.001",          ← era "codice"
+  "descrizione":      "Scavo a sezione...",
+  "descrizione_breve":"Scavo sez. obbligata",
+  "um":               "mc",
+  "prezzo_unitario":  18.50,
+  "lotto":            "L1",
+  "wbs":              "1.2",
+  "categoria":        "Scavi",
+  "sottocategoria":   "Meccanici",
+  "note":             "",
+  "tipo":             "standard",            ← "standard"|"sovrapprezzo_pct"|"riferimento"
+  "sovrapprezzo_pct": null,                  ← % se tipo==sovrapprezzo_pct (es. 15.0)
+  "rif_voce_id":      null,                  ← id voce padre per sovrapprezzo/riferimento
+  "misurazioni": [
+    {
+      "id":               "m_001",
+      "commento":         "Tratto A-B via Roma",   ← era "descrizione"
+      "simili":           2.0,                     ← era "parti" (n° pezzi uguali)
+      "lung":             15.50,
+      "larg":             3.00,
+      "alt":              2.50,
+      "quantita_diretta": 0.0,                     ← era "quantita" (usata se no dimensioni)
+      "tipo_riga":        "standard",              ← "standard"|"sottrazione"|"riferimento_voce"
+      "rif_voce_id":      null                     ← per tipo_riga==riferimento_voce
+    }
+  ],
+  "quantita_totale": 232.50,
+  "importo":         4301.25
+}
 
-MISURAZIONE (dict):
-    descrizione : str
-    parti       : float  (parti uguali, default 1)
-    lung        : float  (lunghezza)
-    larg        : float  (larghezza)
-    alt         : float  (altezza / peso)
-    quantita    : float  (quantità diretta, usata se lung/larg/alt = 0)
+Logica Sovrapprezzi (tipo == "sovrapprezzo_pct")
+─────────────────────────────────────────────────
+  Opzione A – Nella colonna Simili (quantità):
+      Inserire il coefficiente percentuale come quantita_diretta (es. 0.15 per 15%).
+      Il prezzo unitario della voce viene calcolato come:
+          PU_sovrapprezzo = PU_voce_rif * sovrapprezzo_pct / 100
+      La quantità è quella dalla voce_rif (copiata tramite riferimento_voce).
 
-PREZZIARIO (pd.DataFrame):
-    colonne: CODICE, DESCRIZIONE, UM, PREZZO, FONTE
+  Opzione B – Trasformazione diretta del prezzo (calcolata in calcola_importo):
+      importo = importo_voce_rif * sovrapprezzo_pct / 100
+      Quantità = quella della voce di riferimento.
+
+Logica Riferimento Voce (tipo_riga == "riferimento_voce")
+──────────────────────────────────────────────────────────
+  Una riga misurazione con tipo_riga=="riferimento_voce" e rif_voce_id valorizzato
+  restituisce la quantita_totale della voce referenziata.
+  Supporta catene: A → B → C (con ciclo-detection).
 """
 
 from __future__ import annotations
@@ -36,10 +66,10 @@ from __future__ import annotations
 import io
 import json
 import re
+import uuid
 from typing import Any
 
 import pandas as pd
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COSTANTI
@@ -47,13 +77,19 @@ import pandas as pd
 
 COLONNE_PREZZIARIO = ["CODICE", "DESCRIZIONE", "UM", "PREZZO", "FONTE"]
 
+TIPI_VOCE      = ("standard", "sovrapprezzo_pct", "riferimento")
+TIPI_RIGA      = ("standard", "sottrazione", "riferimento_voce")
+
 MISURAZIONE_VUOTA: dict = {
-    "descrizione": "",
-    "parti":       1.0,
-    "lung":        0.0,
-    "larg":        0.0,
-    "alt":         0.0,
-    "quantita":    0.0,
+    "id":               "",
+    "commento":         "",
+    "simili":           1.0,
+    "lung":             0.0,
+    "larg":             0.0,
+    "alt":              0.0,
+    "quantita_diretta": 0.0,
+    "tipo_riga":        "standard",
+    "rif_voce_id":      None,
 }
 
 
@@ -86,73 +122,227 @@ def _safe_float(val: Any) -> float:
         return 0.0
 
 
+def _new_mis_id() -> str:
+    return f"m_{uuid.uuid4().hex[:8]}"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# LIBRETTO DELLE MISURE
+# BACKWARD COMPATIBILITY  – Mapping campi vecchi → nuovi
 # ══════════════════════════════════════════════════════════════════════════════
 
-def quantita_misurazione(m: dict) -> float:
+def _normalizza_misurazione(m: dict) -> dict:
+    """Migra un dict misurazione vecchio formato → nuovo formato."""
+    out = dict(MISURAZIONE_VUOTA)
+    out["id"]               = m.get("id") or _new_mis_id()
+    out["commento"]         = m.get("commento") or m.get("descrizione", "")
+    out["simili"]           = float(m.get("simili") or m.get("parti", 1) or 1)
+    out["lung"]             = float(m.get("lung", 0) or 0)
+    out["larg"]             = float(m.get("larg", 0) or 0)
+    out["alt"]              = float(m.get("alt",  0) or 0)
+    out["quantita_diretta"] = float(m.get("quantita_diretta") or m.get("quantita", 0) or 0)
+    out["tipo_riga"]        = m.get("tipo_riga", "standard")
+    out["rif_voce_id"]      = m.get("rif_voce_id")
+    return out
+
+
+def _normalizza_voce(v: dict) -> dict:
+    """Migra una voce vecchio formato → nuovo formato."""
+    v.setdefault("progressiva",      "")
+    v.setdefault("articolo",         v.get("codice", ""))
+    v.setdefault("descrizione_breve","")
+    v.setdefault("lotto",            "")
+    v.setdefault("tipo",             "standard")
+    v.setdefault("sovrapprezzo_pct", None)
+    v.setdefault("rif_voce_id",      None)
+    # migra misurazioni
+    v["misurazioni"] = [_normalizza_misurazione(m) for m in (v.get("misurazioni") or [])]
+    return v
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIBRETTO DELLE MISURE  –  Calcolo quantità
+# ══════════════════════════════════════════════════════════════════════════════
+
+def quantita_misurazione(
+    m: dict,
+    computo: list[dict] | None = None,
+    _visited: set | None = None,
+) -> float:
     """
-    Calcola la quantità di una riga di misurazione.
-    - Se lung/larg/alt valorizzati → parti × lung × larg × alt (0 → 1)
-    - Altrimenti → parti × quantita (campo diretto)
+    Calcola la quantità di una riga misurazione.
+
+    Tipi riga:
+      standard          → simili × (lung × larg × alt)  oppure  simili × quantita_diretta
+      sottrazione       → valore negativo del calcolo standard
+      riferimento_voce  → quantita_totale della voce referenziata (ciclo-safe)
     """
-    parti = float(m.get("parti", 1) or 1)
-    lung  = float(m.get("lung",  0) or 0)
-    larg  = float(m.get("larg",  0) or 0)
-    alt   = float(m.get("alt",   0) or 0)
+    tipo = m.get("tipo_riga", "standard")
+
+    # ── Riferimento voce ──────────────────────────────────────────────────────
+    if tipo == "riferimento_voce" and computo is not None:
+        rif_id = m.get("rif_voce_id")
+        if rif_id is not None:
+            if _visited is None:
+                _visited = set()
+            if rif_id in _visited:
+                return 0.0  # ciclo rilevato
+            _visited.add(rif_id)
+            rif_voce = next((v for v in computo if v["id"] == rif_id), None)
+            if rif_voce is not None:
+                return quantita_totale_voce(rif_voce, computo, _visited=_visited)
+        return 0.0
+
+    # ── Calcolo dimensionale ──────────────────────────────────────────────────
+    simili = float(m.get("simili", 1) or 1)
+    lung   = float(m.get("lung",   0) or 0)
+    larg   = float(m.get("larg",   0) or 0)
+    alt    = float(m.get("alt",    0) or 0)
 
     if lung or larg or alt:
         l = lung if lung else 1.0
         w = larg if larg else 1.0
         h = alt  if alt  else 1.0
-        return round(parti * l * w * h, 4)
-    return round(parti * float(m.get("quantita", 0) or 0), 4)
+        q = round(simili * l * w * h, 4)
+    else:
+        q = round(simili * float(m.get("quantita_diretta", 0) or 0), 4)
+
+    return -q if tipo == "sottrazione" else q
 
 
-def quantita_totale_voce(voce: dict) -> float:
-    """Somma le quantità di tutte le righe di misurazione."""
+def quantita_totale_voce(
+    voce: dict,
+    computo: list[dict] | None = None,
+    _visited: set | None = None,
+) -> float:
+    """
+    Somma le quantità di tutte le righe di misurazione.
+
+    Se tipo == "riferimento": restituisce la quantita_totale della voce padre.
+    """
+    tipo = voce.get("tipo", "standard")
+
+    # ── Voce di tipo Riferimento (copia quantità da altra voce) ───────────────
+    if tipo == "riferimento" and computo is not None:
+        rif_id = voce.get("rif_voce_id")
+        if rif_id is not None:
+            if _visited is None:
+                _visited = set()
+            vid = voce["id"]
+            if vid in _visited:
+                return 0.0
+            _visited.add(vid)
+            padre = next((v for v in computo if v["id"] == rif_id), None)
+            if padre is not None:
+                return quantita_totale_voce(padre, computo, _visited=_visited)
+        return 0.0
+
     misurazioni = voce.get("misurazioni") or []
     if not misurazioni:
-        return float(voce.get("quantita", 0) or 0)
-    return round(sum(quantita_misurazione(m) for m in misurazioni), 4)
+        return float(voce.get("quantita_diretta", 0) or voce.get("quantita_totale", 0) or 0)
+    return round(
+        sum(quantita_misurazione(m, computo, _visited=set(_visited or ())) for m in misurazioni),
+        4,
+    )
 
 
-def calcola_importo(voce: dict) -> float:
-    """Importo = quantità totale × prezzo unitario."""
-    return round(quantita_totale_voce(voce) * float(voce.get("prezzo_unitario", 0) or 0), 2)
+def calcola_importo(
+    voce: dict,
+    computo: list[dict] | None = None,
+) -> float:
+    """
+    Calcola l'importo della voce.
+
+    Tipi:
+      standard          → quantita_totale × prezzo_unitario
+      sovrapprezzo_pct  → importo_voce_rif × sovrapprezzo_pct/100
+      riferimento       → quantita_totale (ereditata) × prezzo_unitario
+    """
+    tipo = voce.get("tipo", "standard")
+    qt   = quantita_totale_voce(voce, computo)
+
+    # ── Sovrapprezzo % sull'importo della voce di riferimento ─────────────────
+    if tipo == "sovrapprezzo_pct" and computo is not None:
+        pct    = float(voce.get("sovrapprezzo_pct", 0) or 0)
+        rif_id = voce.get("rif_voce_id")
+        if rif_id is not None:
+            padre = next((v for v in computo if v["id"] == rif_id), None)
+            if padre is not None:
+                base = calcola_importo(padre, computo)
+                return round(base * pct / 100.0, 2)
+        # Fallback: usa quantita_diretta × PU × pct
+        pu = float(voce.get("prezzo_unitario", 0) or 0)
+        return round(qt * pu * pct / 100.0, 2)
+
+    pu = float(voce.get("prezzo_unitario", 0) or 0)
+    return round(qt * pu, 2)
 
 
 def aggiorna_importi(computo: list[dict]) -> None:
     """Ricalcola quantita_totale e importo per tutte le voci. In-place."""
+    # Prima normalizza tutti i formati
     for v in computo:
-        v["quantita_totale"] = quantita_totale_voce(v)
-        v["importo"]         = calcola_importo(v)
+        _normalizza_voce(v)
+    # Poi ricalcola (passando il computo intero per i riferimenti)
+    for v in computo:
+        v["quantita_totale"] = quantita_totale_voce(v, computo)
+        v["importo"]         = calcola_importo(v, computo)
 
 
 def nuova_misurazione(**kwargs) -> dict:
     m = dict(MISURAZIONE_VUOTA)
+    m["id"] = _new_mis_id()
     m.update(kwargs)
     return m
 
 
 def nuova_voce(next_id: int, **kwargs) -> dict:
-    """Crea una voce di computo con struttura completa e valori di default."""
+    """Crea una voce di computo con struttura completa v2.0."""
     v: dict = {
-        "id":              next_id,
-        "wbs":             "",
-        "categoria":       "",
-        "sottocategoria":  "",
-        "codice":          "",
-        "descrizione":     "",
-        "um":              "",
-        "prezzo_unitario": 0.0,
-        "note":            "",
-        "misurazioni":     [nuova_misurazione()],
-        "quantita_totale": 0.0,
-        "importo":         0.0,
+        "id":               next_id,
+        "progressiva":      "",
+        "articolo":         "",
+        "descrizione":      "",
+        "descrizione_breve":"",
+        "um":               "",
+        "prezzo_unitario":  0.0,
+        "lotto":            "",
+        "wbs":              "",
+        "categoria":        "",
+        "sottocategoria":   "",
+        "note":             "",
+        "tipo":             "standard",
+        "sovrapprezzo_pct": None,
+        "rif_voce_id":      None,
+        "misurazioni":      [nuova_misurazione()],
+        "quantita_totale":  0.0,
+        "importo":          0.0,
     }
     v.update(kwargs)
+    # Mantieni compatibilità: se passato "codice", mettilo in "articolo"
+    if "codice" in kwargs and not kwargs.get("articolo"):
+        v["articolo"] = kwargs["codice"]
     return v
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROGRESSIVA  –  Assegnazione automatica numeri progressivi
+# ══════════════════════════════════════════════════════════════════════════════
+
+def assegna_progressive(computo: list[dict]) -> None:
+    """
+    Assegna il numero progressivo alle voci in base alla categoria.
+    Es: cat "Scavi" → 1.1, 1.2, … | cat "Fondazioni" → 2.1, 2.2, …
+    """
+    cat_idx:  dict[str, int] = {}
+    voc_idx:  dict[str, int] = {}
+
+    for v in computo:
+        cat = v.get("categoria") or "—"
+        if cat not in cat_idx:
+            cat_idx[cat]  = len(cat_idx) + 1
+            voc_idx[cat]  = 0
+        voc_idx[cat]  += 1
+        v["progressiva"] = f"{cat_idx[cat]}.{voc_idx[cat]}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -164,22 +354,22 @@ def totale_computo(computo: list[dict]) -> float:
 
 
 def riepilogo_wbs(computo: list[dict]) -> pd.DataFrame:
-    """Aggrega per WBS/categoria. Restituisce DataFrame ordinato per importo."""
     if not computo:
-        return pd.DataFrame(columns=["WBS", "Categoria", "Sottocategoria", "N. voci", "Importo €"])
+        return pd.DataFrame(columns=["WBS", "Lotto", "Categoria", "Sottocategoria", "N. voci", "Importo €"])
 
     rows = [
         {
             "WBS":            v.get("wbs", ""),
+            "Lotto":          v.get("lotto", ""),
             "Categoria":      v.get("categoria") or "— Senza categoria —",
             "Sottocategoria": v.get("sottocategoria", ""),
             "Importo":        v.get("importo", 0.0),
         }
         for v in computo
     ]
-    df  = pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
     agg = (
-        df.groupby(["WBS", "Categoria", "Sottocategoria"])["Importo"]
+        df.groupby(["WBS", "Lotto", "Categoria", "Sottocategoria"])["Importo"]
         .agg(N_voci="count", Importo="sum")
         .reset_index()
         .rename(columns={"Importo": "Importo €", "N_voci": "N. voci"})
@@ -190,28 +380,29 @@ def riepilogo_wbs(computo: list[dict]) -> pd.DataFrame:
 
 
 def computo_to_dataframe(computo: list[dict]) -> pd.DataFrame:
-    """DataFrame piatto per visualizzazione e CSV export."""
     if not computo:
         return pd.DataFrame()
     return pd.DataFrame([
         {
-            "N.":             v.get("id", ""),
-            "WBS":            v.get("wbs", ""),
-            "Categoria":      v.get("categoria", ""),
-            "Sottocategoria": v.get("sottocategoria", ""),
-            "Codice":         v.get("codice", ""),
-            "Descrizione":    str(v.get("descrizione", "") or "")[:120],
-            "UM":             v.get("um", ""),
-            "Quantità":       v.get("quantita_totale", 0),
-            "P.U. €":         v.get("prezzo_unitario", 0),
-            "Importo €":      v.get("importo", 0),
+            "Prg.":          v.get("progressiva", ""),
+            "Articolo":      v.get("articolo") or v.get("codice", ""),
+            "Breve":         str(v.get("descrizione_breve", "") or v.get("descrizione", ""))[:50],
+            "Descrizione":   str(v.get("descrizione", "") or "")[:120],
+            "UM":            v.get("um", ""),
+            "Quantità":      v.get("quantita_totale", 0),
+            "P.U. €":        v.get("prezzo_unitario", 0),
+            "Importo €":     v.get("importo", 0),
+            "Lotto":         v.get("lotto", ""),
+            "WBS":           v.get("wbs", ""),
+            "Categoria":     v.get("categoria", ""),
+            "Tipo":          v.get("tipo", "standard"),
         }
         for v in computo
     ])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PARSING PREZZIARIO DA PDF  (PyMuPDF → pdfplumber fallback)
+# PARSING PREZZIARIO DA PDF
 # ══════════════════════════════════════════════════════════════════════════════
 
 _RE_CODICE = re.compile(r"^[A-Za-z]{1,3}\.\d{2,3}(?:\.\d{3})?(?:\.[a-z])?$")
@@ -232,7 +423,7 @@ def _parse_rows_from_table(table: list, nome: str) -> list[dict]:
         if "descrizione" in code_cell.lower():
             continue
 
-        codes  = [c.strip() for c in code_cell.split("\n")  if c.strip()]
+        codes  = [c.strip() for c in code_cell.split("\n") if c.strip()]
         prices = [p.strip() for p in price_cell.split("\n") if p.strip()]
         ums    = [u.strip() for u in um_cell.split("\n")    if u.strip()]
         descs  = desc_cell.split("\n")
@@ -258,7 +449,6 @@ def _parse_rows_from_table(table: list, nome: str) -> list[dict]:
 
 
 def _extract_rows_from_text(text: str, nome: str) -> list[dict]:
-    """Parser regex fallback per PDF a testo libero."""
     rows = []
     pattern = re.compile(
         r"^([A-Za-z]{1,3}\.\d{2,3}(?:\.\d{3})?(?:\.[a-z])?)"
@@ -288,13 +478,7 @@ def _finalize_df(rows: list[dict]) -> pd.DataFrame:
 
 
 def extract_pdf_prezziario(pdf_bytes: bytes, nome: str) -> pd.DataFrame:
-    """
-    Estrae voci da PDF prezziario.
-    Strategia: PyMuPDF (veloce) → pdfplumber (fallback).
-    """
     rows: list[dict] = []
-
-    # ── PyMuPDF ───────────────────────────────────────────────────────────────
     try:
         import fitz
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
@@ -309,7 +493,6 @@ def extract_pdf_prezziario(pdf_bytes: bytes, nome: str) -> pd.DataFrame:
     except ImportError:
         pass
 
-    # ── pdfplumber ────────────────────────────────────────────────────────────
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -359,8 +542,7 @@ def _map_columns(columns: list[str]) -> dict[str, str]:
 
 
 def extract_xlsx_prezziario(xlsx_bytes: bytes, nome: str) -> pd.DataFrame:
-    """Legge XLSX/XLS come prezziario con rilevamento automatico colonne."""
-    xls = pd.ExcelFile(io.BytesIO(xlsx_bytes))
+    xls  = pd.ExcelFile(io.BytesIO(xlsx_bytes))
     dfs: list[pd.DataFrame] = []
 
     for sheet in xls.sheet_names:
@@ -377,12 +559,12 @@ def extract_xlsx_prezziario(xlsx_bytes: bytes, nome: str) -> pd.DataFrame:
         if not all(k in col_map for k in ("CODICE", "DESCRIZIONE", "PREZZO")):
             continue
 
-        wanted  = [k for k in ("CODICE", "DESCRIZIONE", "UM", "PREZZO") if k in col_map]
-        sub     = raw[[col_map[k] for k in wanted]].copy()
+        wanted = [k for k in ("CODICE", "DESCRIZIONE", "UM", "PREZZO") if k in col_map]
+        sub    = raw[[col_map[k] for k in wanted]].copy()
         sub.columns = wanted
-        sub     = sub.dropna(subset=["CODICE", "PREZZO"])
+        sub    = sub.dropna(subset=["CODICE", "PREZZO"])
         sub["PREZZO"] = pd.to_numeric(sub["PREZZO"], errors="coerce").fillna(0)
-        sub     = sub[sub["PREZZO"] > 0].copy()
+        sub    = sub[sub["PREZZO"] > 0].copy()
 
         if not sub.empty:
             sub["FONTE"] = nome
@@ -454,7 +636,6 @@ def import_computo_from_xlsx(
     col_pu:       int,
     start_id:     int = 1,
 ) -> tuple[list[dict], int]:
-    """Importa voci da XLSX esistente con mapping manuale colonne (0-based)."""
     raw        = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet_name, header=None)
     dati       = raw.iloc[header_row + 1:].copy()
     voci:      list[dict] = []
@@ -473,11 +654,11 @@ def import_computo_from_xlsx(
         if not cod and not desc:
             continue
 
-        mis = nuova_misurazione(descrizione="da XLSX", quantita=q)
+        mis = nuova_misurazione(commento="da XLSX", quantita_diretta=q)
         v   = nuova_voce(
             current_id,
             categoria=cat or "—", sottocategoria=sottocat,
-            codice=cod, descrizione=desc, um=um, prezzo_unitario=pu,
+            articolo=cod, descrizione=desc, um=um, prezzo_unitario=pu,
             note="importato da XLSX", misurazioni=[mis],
         )
         v["quantita_totale"] = quantita_totale_voce(v)
@@ -494,7 +675,7 @@ def import_computo_from_xlsx(
 
 def export_json(computo: list[dict], nomi_prezziari: list[str]) -> str:
     return json.dumps(
-        {"computo": computo, "prezziari_caricati": nomi_prezziari},
+        {"computo": computo, "prezziari_caricati": nomi_prezziari, "version": "2.0"},
         ensure_ascii=False, indent=2,
     )
 
@@ -513,22 +694,16 @@ def import_json(data: bytes | str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ESPORTAZIONE EXCEL  (formule vive + foglio riepilogo WBS)
+# ESPORTAZIONE EXCEL  (formule vive + riepilogo WBS)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def export_excel(computo: list[dict], titolo_progetto: str = "Computo Metrico Estimativo") -> bytes:
-    """
-    Genera Excel professionale con:
-    - Foglio «Computo»: voci + libretto misure con FORMULE EXCEL vive
-    - Foglio «Riepilogo WBS»: totali per categoria
-    """
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 
     wb = Workbook()
 
-    # ── Palette colori ────────────────────────────────────────────────────────
     C_DARK   = "1A1F36"
     C_MED    = "2D3561"
     C_ACCENT = "4A6CF7"
@@ -554,22 +729,20 @@ def export_excel(computo: list[dict], titolo_progetto: str = "Computo Metrico Es
     FMT_N3  = '#,##0.000'
     FMT_N2  = '#,##0.00'
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # FOGLIO 1 – COMPUTO METRICO
-    # ══════════════════════════════════════════════════════════════════════════
+    # Colonne: A=Prg B=Lotto C=WBS D=Articolo E=Descrizione F=UM
+    #          G=Commento H=Simili I=Lung J=Larg K=Alt L=Qtà M=PU N=Importo
+    widths = [
+        ("A", 6), ("B", 7), ("C", 7), ("D", 12), ("E", 50), ("F", 6),
+        ("G", 22), ("H", 7), ("I", 9), ("J", 9), ("K", 9), ("L", 12), ("M", 14), ("N", 15),
+    ]
     ws = wb.active
     ws.title        = "Computo Metrico"
     ws.freeze_panes = "A4"
-
-    # Larghezze: A=N.  B=WBS  C=Codice  D=Descrizione  E=UM
-    #            F=Parti  G=Lung  H=Larg  I=Alt  J=Qtà  K=P.U.  L=Importo
-    widths = [("A",5),("B",8),("C",14),("D",55),("E",7),
-              ("F",7),("G",9), ("H",9), ("I",9), ("J",12),("K",14),("L",15)]
     for col_l, w in widths:
         ws.column_dimensions[col_l].width = w
 
-    # Riga 1 – Titolo
-    ws.merge_cells("A1:L1")
+    # Titolo
+    ws.merge_cells("A1:N1")
     c = ws["A1"]
     c.value     = titolo_progetto.upper()
     c.font      = _font(bold=True, color=C_WHITE, size=14)
@@ -577,9 +750,9 @@ def export_excel(computo: list[dict], titolo_progetto: str = "Computo Metrico Es
     c.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 32
 
-    # Riga 2 – Intestazioni
-    hdrs = ["N.", "WBS", "Codice", "Descrizione / Misurazione",
-            "UM", "Parti", "Lung.", "Larg.", "Alt./Peso", "Quantità", "P.U. €", "Importo €"]
+    # Intestazioni
+    hdrs = ["Prg.", "Lotto", "WBS", "Articolo", "Descrizione / Commento",
+            "UM", "Commento mis.", "Simili", "Lung.", "Larg.", "Alt.", "Quantità", "P.U. €", "Importo €"]
     for ci, h in enumerate(hdrs, 1):
         cell = ws.cell(row=2, column=ci, value=h)
         cell.font      = _font(bold=True, color=C_WHITE)
@@ -592,12 +765,12 @@ def export_excel(computo: list[dict], titolo_progetto: str = "Computo Metrico Es
     current_cat = None
 
     for voce in computo:
-        cat = voce.get("categoria", "") or "—"
+        cat  = voce.get("categoria", "") or "—"
+        tipo = voce.get("tipo", "standard")
 
-        # Separatore categoria
         if cat != current_cat:
             current_cat = cat
-            ws.merge_cells(f"A{data_row}:L{data_row}")
+            ws.merge_cells(f"A{data_row}:N{data_row}")
             label = f"  {cat.upper()}"
             sc = voce.get("sottocategoria", "")
             if sc:
@@ -613,40 +786,47 @@ def export_excel(computo: list[dict], titolo_progetto: str = "Computo Metrico Es
         voce_row    = data_row
         misurazioni = voce.get("misurazioni") or []
 
-        # Riga voce – colonne A..E + K
-        def _vc(col, val=None, **kw):
+        def _vc(col, val=None):
             cell = ws.cell(row=voce_row, column=col, value=val)
             cell.border = brd_thin
             return cell
 
-        _vc(1, voce.get("id", "")).alignment     = al_c
-        _vc(2, voce.get("wbs", "")).alignment     = al_c
-        c3 = _vc(3, voce.get("codice", ""))
-        c3.font      = _font(color=C_MED)
-        c3.alignment = al_c
+        _vc(1, voce.get("progressiva", "")).alignment = al_c
+        _vc(2, voce.get("lotto", "")).alignment       = al_c
+        _vc(3, voce.get("wbs", "")).alignment         = al_c
 
-        c4 = _vc(4, voce.get("descrizione", ""))
-        c4.font      = _font(bold=True)
-        c4.alignment = al_l
+        c4 = _vc(4, voce.get("articolo") or voce.get("codice", ""))
+        c4.font      = _font(color=C_MED)
+        c4.alignment = al_c
 
-        _vc(5, voce.get("um", "")).alignment      = al_c
+        # Descrizione + nota sovrapprezzo
+        desc = voce.get("descrizione", "")
+        if tipo == "sovrapprezzo_pct":
+            pct = voce.get("sovrapprezzo_pct", 0)
+            desc = f"[SOVR. {pct}%] {desc}"
+        elif tipo == "riferimento":
+            desc = f"[RIF.→#{voce.get('rif_voce_id','')}] {desc}"
 
-        # F,G,H,I vuoti nella riga voce
-        for ci in (6, 7, 8, 9):
+        c5 = _vc(5, desc)
+        c5.font      = _font(bold=True)
+        c5.alignment = al_l
+
+        _vc(6, voce.get("um", "")).alignment = al_c
+
+        for ci in range(7, 12):
             ws.cell(row=voce_row, column=ci).border = brd_thin
 
-        # J (Quantità) e L (Importo) saranno formule → compilate dopo le misurazioni
-        ws.cell(row=voce_row, column=10).border        = brd_thin
-        ws.cell(row=voce_row, column=10).number_format = FMT_N3
-        ws.cell(row=voce_row, column=10).alignment     = al_c
+        ws.cell(row=voce_row, column=12).border        = brd_thin
+        ws.cell(row=voce_row, column=12).number_format = FMT_N3
+        ws.cell(row=voce_row, column=12).alignment     = al_c
 
-        ck = ws.cell(row=voce_row, column=11, value=voce.get("prezzo_unitario", 0))
+        ck = ws.cell(row=voce_row, column=13, value=voce.get("prezzo_unitario", 0))
         ck.font          = _font(bold=True, color=C_MED)
         ck.number_format = FMT_EUR
         ck.border        = brd_thin
         ck.alignment     = al_r
 
-        cl = ws.cell(row=voce_row, column=12)
+        cl = ws.cell(row=voce_row, column=14)
         cl.font          = _font(bold=True, color=C_DGREEN)
         cl.number_format = FMT_EUR
         cl.border        = brd_thin
@@ -656,54 +836,58 @@ def export_excel(computo: list[dict], titolo_progetto: str = "Computo Metrico Es
         ws.row_dimensions[voce_row].height = 22
         data_row += 1
 
-        # Righe di misurazione
         mis_start = data_row
         for mis in misurazioni:
+            tipo_riga = mis.get("tipo_riga", "standard")
+
             def _mc(col, val=None):
                 cell = ws.cell(row=data_row, column=col, value=val)
                 cell.border = brd_thin
                 return cell
 
-            for ci in (1, 2, 3, 5):
+            for ci in (1, 2, 3, 4, 6):
                 _mc(ci)
 
-            cm4 = _mc(4, f"    {mis.get('descrizione', '')}")
-            cm4.font      = _font(italic=True, color="666666")
-            cm4.alignment = al_l
+            commento_txt = mis.get("commento", "")
+            if tipo_riga == "sottrazione":
+                commento_txt = f"(–) {commento_txt}"
+            elif tipo_riga == "riferimento_voce":
+                commento_txt = f"[→#{mis.get('rif_voce_id','')}] {commento_txt}"
 
-            _mc(6, mis.get("parti", 1) or 1).number_format  = FMT_N2
-            _mc(7, mis.get("lung",  0) or 0).number_format  = FMT_N2
-            _mc(8, mis.get("larg",  0) or 0).number_format  = FMT_N2
-            _mc(9, mis.get("alt",   0) or 0).number_format  = FMT_N2
-            for ci in (6, 7, 8, 9):
+            cm5 = _mc(7, commento_txt)
+            cm5.font      = _font(italic=True, color="666666")
+            cm5.alignment = al_l
+
+            _mc(8,  mis.get("simili",           1) or 1).number_format = FMT_N2
+            _mc(9,  mis.get("lung",             0) or 0).number_format = FMT_N2
+            _mc(10, mis.get("larg",             0) or 0).number_format = FMT_N2
+            _mc(11, mis.get("alt",              0) or 0).number_format = FMT_N2
+            for ci in (8, 9, 10, 11):
                 ws.cell(row=data_row, column=ci).alignment = al_c
 
-            # Quantità riga → formula Excel
-            r  = data_row
-            cF, cG, cH, cI = "F", "G", "H", "I"
+            r = data_row
             has_dim = (mis.get("lung") or 0) or (mis.get("larg") or 0) or (mis.get("alt") or 0)
             if has_dim:
-                fq = (f"={cF}{r}"
-                      f"*IF({cG}{r}=0,1,{cG}{r})"
-                      f"*IF({cH}{r}=0,1,{cH}{r})"
-                      f"*IF({cI}{r}=0,1,{cI}{r})")
+                sign = "-" if tipo_riga == "sottrazione" else ""
+                fq = (f"={sign}H{r}"
+                      f"*IF(I{r}=0,1,I{r})"
+                      f"*IF(J{r}=0,1,J{r})"
+                      f"*IF(K{r}=0,1,K{r})")
             else:
-                direct_q  = mis.get("quantita", 0) or 0
-                fq        = None
-                cq_direct = ws.cell(row=data_row, column=10,
-                                    value=round(float(mis.get("parti", 1) or 1) * direct_q, 4))
-                cq_direct.number_format = FMT_N3
-                cq_direct.border        = brd_thin
-                cq_direct.alignment     = al_c
-
-            if fq:
-                cq = ws.cell(row=data_row, column=10, value=fq)
+                q_val = quantita_misurazione(mis)
+                fq    = None
+                cq    = ws.cell(row=data_row, column=12, value=q_val)
                 cq.number_format = FMT_N3
                 cq.border        = brd_thin
                 cq.alignment     = al_c
 
-            # K e L vuoti nelle righe misurazioni
-            for ci in (11, 12):
+            if fq:
+                cq = ws.cell(row=data_row, column=12, value=fq)
+                cq.number_format = FMT_N3
+                cq.border        = brd_thin
+                cq.alignment     = al_c
+
+            for ci in (13, 14):
                 ws.cell(row=data_row, column=ci).border = brd_thin
 
             ws.row_dimensions[data_row].height = 17
@@ -711,22 +895,19 @@ def export_excel(computo: list[dict], titolo_progetto: str = "Computo Metrico Es
 
         mis_end = data_row - 1
 
-        # Ora compila J e L della riga voce con formule
-        j_range  = f"J{mis_start}:J{mis_end}" if misurazioni else None
-        j_formula = f"=SUM({j_range})" if j_range else (voce.get("quantita_totale", 0))
-        ws.cell(row=voce_row, column=10).value = j_formula
-        ws.cell(row=voce_row, column=12).value = f"=J{voce_row}*K{voce_row}"
+        j_formula = f"=SUM(L{mis_start}:L{mis_end})" if misurazioni else voce.get("quantita_totale", 0)
+        ws.cell(row=voce_row, column=12).value = j_formula
+        ws.cell(row=voce_row, column=14).value = f"=L{voce_row}*M{voce_row}"
 
     # Riga totale
-    ws.merge_cells(f"A{data_row}:K{data_row}")
+    ws.merge_cells(f"A{data_row}:M{data_row}")
     tl = ws.cell(row=data_row, column=1, value="TOTALE COMPLESSIVO")
     tl.font      = _font(bold=True, color=C_WHITE, size=11)
     tl.fill      = _fill(C_DARK)
     tl.alignment = al_r
     tl.border    = brd_thk
 
-    tv = ws.cell(row=data_row, column=12,
-                 value=f"=SUMIF(L3:L{data_row-1},\">0\")")
+    tv = ws.cell(row=data_row, column=14, value=f"=SUMIF(N3:N{data_row-1},\">0\")")
     tv.font          = _font(bold=True, color=C_WHITE, size=11)
     tv.fill          = _fill(C_DARK)
     tv.number_format = FMT_EUR
@@ -734,14 +915,12 @@ def export_excel(computo: list[dict], titolo_progetto: str = "Computo Metrico Es
     tv.border        = brd_thk
     ws.row_dimensions[data_row].height = 26
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # FOGLIO 2 – RIEPILOGO WBS
-    # ══════════════════════════════════════════════════════════════════════════
+    # Foglio 2 – Riepilogo WBS
     ws2    = wb.create_sheet("Riepilogo WBS")
     df_wbs = riepilogo_wbs(computo)
-    rhdrs  = ["WBS", "Categoria", "Sottocategoria", "N. voci", "Importo €"]
+    rhdrs  = ["WBS", "Lotto", "Categoria", "Sottocategoria", "N. voci", "Importo €"]
 
-    ws2.merge_cells("A1:E1")
+    ws2.merge_cells("A1:F1")
     th = ws2["A1"]
     th.value     = f"{titolo_progetto.upper()} – RIEPILOGO WBS"
     th.font      = _font(bold=True, color=C_WHITE, size=12)
@@ -749,7 +928,7 @@ def export_excel(computo: list[dict], titolo_progetto: str = "Computo Metrico Es
     th.alignment = Alignment(horizontal="center", vertical="center")
     ws2.row_dimensions[1].height = 28
 
-    for cl, w in [("A",8),("B",35),("C",30),("D",10),("E",16)]:
+    for cl, w in [("A",8),("B",8),("C",35),("D",30),("E",10),("F",16)]:
         ws2.column_dimensions[cl].width = w
 
     for ci, h in enumerate(rhdrs, 1):
@@ -774,14 +953,16 @@ def export_excel(computo: list[dict], titolo_progetto: str = "Computo Metrico Es
                 cell.alignment = al_l
 
     tot_r = len(df_wbs) + 3
-    ws2.merge_cells(f"A{tot_r}:D{tot_r}")
+    ws2.merge_cells(f"A{tot_r}:E{tot_r}")
     tl2 = ws2.cell(row=tot_r, column=1, value="TOTALE COMPLESSIVO")
     tl2.font = _font(bold=True, color=C_WHITE)
-    tl2.fill = _fill(C_DARK); tl2.alignment = al_r
-    tv2 = ws2.cell(row=tot_r, column=5, value=totale_computo(computo))
+    tl2.fill = _fill(C_DARK)
+    tl2.alignment = al_r
+    tv2 = ws2.cell(row=tot_r, column=6, value=totale_computo(computo))
     tv2.font = _font(bold=True, color=C_WHITE)
     tv2.fill = _fill(C_DARK)
-    tv2.number_format = FMT_EUR; tv2.alignment = al_r
+    tv2.number_format = FMT_EUR
+    tv2.alignment = al_r
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -794,27 +975,19 @@ def export_excel(computo: list[dict], titolo_progetto: str = "Computo Metrico Es
 # ══════════════════════════════════════════════════════════════════════════════
 
 def export_pdf(computo: list[dict], titolo_progetto: str = "Computo Metrico Estimativo") -> bytes:
-    """
-    Genera PDF del computo in formato A4 landscape con:
-    - Intestazione, separatori categoria, libretto misure, totale, footer paginato.
-    Richiede: pip install reportlab
-    """
     try:
         from reportlab.lib import colors
         from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
         from reportlab.lib.pagesizes import A4, landscape
         from reportlab.lib.styles import ParagraphStyle
         from reportlab.lib.units import cm, mm
-        from reportlab.platypus import (
-            Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
-        )
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
     except ImportError as exc:
         raise ImportError("Installa reportlab: pip install reportlab") from exc
 
     PAGE_W, PAGE_H = landscape(A4)
     MARGIN = 1.5 * cm
 
-    # Colori ReportLab
     RL_DARK   = colors.HexColor("#1A1F36")
     RL_ACCENT = colors.HexColor("#4A6CF7")
     RL_LIGHT  = colors.HexColor("#E8ECF4")
@@ -823,37 +996,37 @@ def export_pdf(computo: list[dict], titolo_progetto: str = "Computo Metrico Esti
     RL_GRAY   = colors.HexColor("#888888")
     RL_WHITE  = colors.white
 
-    # Stili paragrafo
-    def _ps(name, font="Helvetica", size=8, color=colors.black, align=TA_LEFT, leading=10, bold=False, italic=False):
+    def _ps(name, font="Helvetica", size=8, color=colors.black, align=TA_LEFT,
+            leading=10, bold=False, italic=False):
         fn = font
         if bold and italic: fn += "-BoldOblique"
-        elif bold:   fn += "-Bold"
-        elif italic: fn += "-Oblique"
+        elif bold:          fn += "-Bold"
+        elif italic:        fn += "-Oblique"
         return ParagraphStyle(name, fontName=fn, fontSize=size,
                               textColor=color, alignment=align, leading=leading)
 
-    s_hdr   = _ps("hdr",  size=7.5, color=RL_WHITE, align=TA_CENTER, bold=True)
-    s_desc  = _ps("desc", size=8,   color=colors.black, align=TA_LEFT, leading=10)
-    s_mit   = _ps("mit",  size=7.5, color=RL_GRAY, align=TA_LEFT, leading=9, italic=True)
-    s_num   = _ps("num",  size=8,   color=colors.black, align=TA_RIGHT)
-    s_numg  = _ps("numg", size=8,   color=RL_GREEN,     align=TA_RIGHT, bold=True)
-    s_code  = _ps("code", font="Courier", size=7.5, color=colors.HexColor("#2D3561"), align=TA_LEFT)
-    s_cat   = _ps("cat",  size=9,   color=RL_DARK, align=TA_LEFT, bold=True)
-    s_tot   = _ps("tot",  size=9,   color=RL_WHITE, align=TA_RIGHT, bold=True)
+    s_hdr  = _ps("hdr",  size=7.5, color=RL_WHITE, align=TA_CENTER, bold=True)
+    s_desc = _ps("desc", size=8,   color=colors.black, align=TA_LEFT, leading=10)
+    s_mit  = _ps("mit",  size=7.5, color=RL_GRAY, align=TA_LEFT, leading=9, italic=True)
+    s_num  = _ps("num",  size=8,   color=colors.black, align=TA_RIGHT)
+    s_numg = _ps("numg", size=8,   color=RL_GREEN, align=TA_RIGHT, bold=True)
+    s_code = _ps("code", font="Courier", size=7.5,
+                 color=colors.HexColor("#2D3561"), align=TA_LEFT)
+    s_cat  = _ps("cat",  size=9,   color=RL_DARK, align=TA_LEFT, bold=True)
+    s_tot  = _ps("tot",  size=9,   color=RL_WHITE, align=TA_RIGHT, bold=True)
 
     def _p(text, style): return Paragraph(str(text), style)
     def _fmt(val, d=2):
         try:    return f"{float(val):,.{d}f}"
         except: return str(val)
 
-    # Larghezze colonne (totale = PAGE_W - 2*MARGIN)
-    COL_W = [0.7, 1.2, 2.2, 8.8, 1.0, 1.3, 1.6, 1.6, 1.6, 1.8, 2.3, 2.7]
+    # Colonne: Prg | Lotto | WBS | Art | Desc/Commento | UM | Sim | Lung | Larg | Alt | Qtà | PU | Imp
+    COL_W = [0.6, 0.9, 0.8, 1.8, 8.0, 0.9, 1.1, 1.4, 1.4, 1.4, 1.7, 2.1, 2.4]
     COL_W = [w * cm for w in COL_W]
 
-    # Header tabella
     hdr_row = [[_p(h, s_hdr) for h in [
-        "N.", "WBS", "Codice", "Descrizione / Misurazione",
-        "UM", "Parti", "Lung.", "Larg.", "Alt.", "Quantità", "P.U. €", "Importo €"
+        "Prg.", "Lotto", "WBS", "Articolo", "Descrizione / Commento",
+        "UM", "Simili", "Lung.", "Larg.", "Alt.", "Quantità", "P.U. €", "Importo €",
     ]]]
 
     table_data = list(hdr_row)
@@ -870,31 +1043,40 @@ def export_pdf(computo: list[dict], titolo_progetto: str = "Computo Metrico Esti
     abs_r = 1
 
     for voce in computo:
-        cat = voce.get("categoria", "") or "—"
+        cat  = voce.get("categoria", "") or "—"
+        tipo = voce.get("tipo", "standard")
 
         if cat != current_cat:
             current_cat = cat
             label = cat.upper()
             sc = voce.get("sottocategoria", "")
             if sc: label += f"  ›  {sc}"
-            table_data.append([_p(f"  {label}", s_cat)] + [""] * 11)
+            table_data.append([_p(f"  {label}", s_cat)] + [""] * 12)
             ts += [
-                ("BACKGROUND",   (0, abs_r), (-1, abs_r), RL_LIGHT),
-                ("SPAN",         (0, abs_r), (-1, abs_r)),
-                ("LINEABOVE",    (0, abs_r), (-1, abs_r), 1, RL_ACCENT),
-                ("TOPPADDING",   (0, abs_r), (-1, abs_r), 5),
-                ("BOTTOMPADDING",(0, abs_r), (-1, abs_r), 5),
+                ("BACKGROUND",    (0, abs_r), (-1, abs_r), RL_LIGHT),
+                ("SPAN",          (0, abs_r), (-1, abs_r)),
+                ("LINEABOVE",     (0, abs_r), (-1, abs_r), 1, RL_ACCENT),
+                ("TOPPADDING",    (0, abs_r), (-1, abs_r), 5),
+                ("BOTTOMPADDING", (0, abs_r), (-1, abs_r), 5),
             ]
             abs_r += 1
 
-        qt = voce.get("quantita_totale", 0)
-        pu = voce.get("prezzo_unitario", 0)
-        im = voce.get("importo", 0)
+        qt  = voce.get("quantita_totale", 0)
+        pu  = voce.get("prezzo_unitario", 0)
+        im  = voce.get("importo", 0)
+        desc = voce.get("descrizione", "")
+        if tipo == "sovrapprezzo_pct":
+            pct  = voce.get("sovrapprezzo_pct", 0)
+            desc = f"[SOVR. {pct}%] {desc}"
+        elif tipo == "riferimento":
+            desc = f"[RIF.→#{voce.get('rif_voce_id','')}] {desc}"
+
         table_data.append([
-            _p(voce.get("id",          ""), s_num),
+            _p(voce.get("progressiva", ""), s_num),
+            _p(voce.get("lotto",       ""), s_num),
             _p(voce.get("wbs",         ""), s_num),
-            _p(voce.get("codice",      ""), s_code),
-            _p(voce.get("descrizione", ""), s_desc),
+            _p(voce.get("articolo") or voce.get("codice", ""), s_code),
+            _p(desc,                        s_desc),
             _p(voce.get("um",          ""), s_num),
             "", "", "", "",
             _p(_fmt(qt, 3), s_numg),
@@ -909,31 +1091,36 @@ def export_pdf(computo: list[dict], titolo_progetto: str = "Computo Metrico Esti
         abs_r += 1
 
         for mis in (voce.get("misurazioni") or []):
-            q_mis = quantita_misurazione(mis)
+            tipo_riga = mis.get("tipo_riga", "standard")
+            q_mis     = quantita_misurazione(mis)
+            commento  = mis.get("commento", "")
+            if tipo_riga == "sottrazione":
+                commento = f"(–) {commento}"
+            elif tipo_riga == "riferimento_voce":
+                commento = f"[→#{mis.get('rif_voce_id','')}] {commento}"
+
             table_data.append([
-                "", "", "",
-                _p(f"    {mis.get('descrizione', '')}", s_mit),
+                "", "", "", "",
+                _p(f"    {commento}", s_mit),
                 "",
-                _p(_fmt(mis.get("parti", 1), 2), s_num),
-                _p(_fmt(mis.get("lung",  0), 2), s_num),
-                _p(_fmt(mis.get("larg",  0), 2), s_num),
-                _p(_fmt(mis.get("alt",   0), 2), s_num),
-                _p(_fmt(q_mis,              3), s_num),
+                _p(_fmt(mis.get("simili", 1), 2), s_num),
+                _p(_fmt(mis.get("lung",   0), 2), s_num),
+                _p(_fmt(mis.get("larg",   0), 2), s_num),
+                _p(_fmt(mis.get("alt",    0), 2), s_num),
+                _p(_fmt(q_mis,            3), s_num),
                 "", "",
             ])
             abs_r += 1
 
-    # Totale
     total = totale_computo(computo)
     table_data.append(
-        [_p("TOTALE COMPLESSIVO", s_tot)] + [""] * 10 +
-        [_p(f"€ {total:,.2f}", s_tot)]
+        [_p("TOTALE COMPLESSIVO", s_tot)] + [""] * 11 + [_p(f"€ {total:,.2f}", s_tot)]
     )
     ts += [
-        ("BACKGROUND",   (0, abs_r), (-1, abs_r), RL_DARK),
-        ("SPAN",         (0, abs_r), (-2, abs_r)),
-        ("TOPPADDING",   (0, abs_r), (-1, abs_r), 7),
-        ("BOTTOMPADDING",(0, abs_r), (-1, abs_r), 7),
+        ("BACKGROUND",    (0, abs_r), (-1, abs_r), RL_DARK),
+        ("SPAN",          (0, abs_r), (-2, abs_r)),
+        ("TOPPADDING",    (0, abs_r), (-1, abs_r), 7),
+        ("BOTTOMPADDING", (0, abs_r), (-1, abs_r), 7),
     ]
 
     main_table = Table(table_data, colWidths=COL_W, repeatRows=1)
@@ -955,8 +1142,8 @@ def export_pdf(computo: list[dict], titolo_progetto: str = "Computo Metrico Esti
         topMargin=MARGIN, bottomMargin=1.8 * cm,
     )
 
-    # Titolo
-    title_data  = [[_p(titolo_progetto.upper(), _ps("tt", size=14, color=RL_WHITE, align=TA_CENTER, bold=True))]]
+    title_data  = [[_p(titolo_progetto.upper(),
+                        _ps("tt", size=14, color=RL_WHITE, align=TA_CENTER, bold=True))]]
     title_table = Table(title_data, colWidths=[PAGE_W - 2 * MARGIN])
     title_table.setStyle(TableStyle([
         ("BACKGROUND",    (0, 0), (-1, -1), RL_DARK),
